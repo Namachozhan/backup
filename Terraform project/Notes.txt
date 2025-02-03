@@ -1,0 +1,23 @@
+Nots:
++++++++++++++
+
+1. Need to change in the variable.tf(Vm name, admin username, admin passwod, Location) and also need to change resource group name, vnet and subnet with respect of your exixting configuration.
+
+2. Powershell script need to be updated in azure blob storage account.
+
+3. Create SAS tokan to access the powershell script and update the url in main.tf( extentsion block).
+4. vm name should be less than 15 charracter and -(dash only allowed)
+
+
+=================
+
+1. It will create a static public ip.
+2. VM wil spin up along with Python and vscode.
+3. its a internet accessable.
+
+prerequesites:
+create azure storage account and blob account store the install script aswell.
+install terraform, azure cli
+authenticate terraform with cli .
+
+

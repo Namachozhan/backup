@@ -1,0 +1,12 @@
+python clone_repo.py '{"source_repo": "https://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@github.com/Namachozhan/Terraformvscode-and-python-project.git", "target_repo": "https://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@github.com/Namachozhan/Terraform_check_Data_and_AI.git"}'
+https://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@github.com/Namachozhan/Terraformvscode-and-python-project.git
+https://github.com/Namachozhan/Terraformvscode-and-python-project.git
+
+
+
+
+#======================================================
+ python check1.py '{ "source_repo": "https://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@github.com/Namachozhan/Terraformvscode-and-python-project.git", "target_repo": "https://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@github.com/Namachozhan/Terraform_check_Data_and_AI.git", "copy_dir_name": "chozhan1", "new_target_dir": "check" }'
+
+
+  python check1.py '{ "source_repo": "https://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@github.com/Namachozhan/Terraformvscode-and-python-project.git", "target_repo": "https://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@github.com/Namachozhan/Terraform_check_Data_and_AI.git", "copy_dir_name": "chozhan1", "new_target_dir": "check" "file_format": "check1", "llm_token_count_algorithm": "check2"}'

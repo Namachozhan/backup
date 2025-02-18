@@ -1,0 +1,346 @@
+import logging
+import json
+import os
+import winrm
+import requests
+import subprocess
+ 
+import azure.functions as func
+ 
+from azure.identity import ClientSecretCredential
+ 
+from azure.storage.blob import BlobServiceClient
+ 
+app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+ 
+def install_tools():
+ 
+    """Install wget and unzip if not already installed."""
+ 
+    try:
+ 
+        # Update package list and install wget and unzip
+ 
+        subprocess.run(["apt-get", "update"], check=True)
+ 
+        subprocess.run(["apt-get", "install", "-y", "wget", "unzip"], check=True)
+ 
+        logging.info("wget and unzip installed successfully.")
+ 
+    except subprocess.CalledProcessError as e:
+ 
+        logging.error(f"Failed to install tools: {e.stderr}")
+ 
+        raise
+ 
+def install_terraform(local_path):
+ 
+    """Install Terraform if not already installed."""
+ 
+    terraform_path = os.path.join(local_path, "terraform")
+ 
+    # Check if Terraform is already installed
+ 
+    if os.path.isfile(terraform_path):
+ 
+        logging.info("Terraform is already installed.")
+ 
+        return terraform_path
+ 
+    logging.info("Installing Terraform...")
+ 
+    terraform_url = "https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip"
+ 
+    terraform_zip = os.path.join(local_path, "terraform.zip")
+ 
+    try:
+ 
+        # Create the local directory if it doesn't exist
+ 
+        os.makedirs(local_path, exist_ok=True)
+ 
+        # Download Terraform
+ 
+        subprocess.run(["wget", "-O", terraform_zip, terraform_url], check=True)
+ 
+        logging.info("Terraform downloaded successfully.")
+ 
+        # Unzip Terraform
+ 
+        subprocess.run(["unzip", terraform_zip, "-d", local_path], check=True)
+ 
+        logging.info("Terraform unzipped successfully.")
+ 
+        # Make Terraform executable
+ 
+        subprocess.run(["chmod", "+x", terraform_path], check=True)
+ 
+        logging.info("Terraform made executable.")
+ 
+        # Clean up the zip file
+ 
+        os.remove(terraform_zip)
+ 
+        logging.info("Terraform installation completed successfully.")
+ 
+        return terraform_path
+ 
+    except subprocess.CalledProcessError as e:
+ 
+        logging.error(f"Failed to install Terraform: {e.stderr}")
+ 
+        raise
+ 
+def download_blob_files(container_name, local_path):
+ 
+    """Download Terraform files from Azure Blob Container using Service Principal."""
+ 
+    try:
+ 
+        # Use Service Principal for authentication
+ 
+        credential = ClientSecretCredential(
+ 
+            tenant_id=os.getenv("AZURE_TENANT_ID"),
+ 
+            client_id=os.getenv("AZURE_CLIENT_ID"),
+ 
+            client_secret=os.getenv("AZURE_CLIENT_SECRET")
+ 
+        )
+ 
+        blob_service_client = BlobServiceClient(
+ 
+            account_url=f"https://{os.getenv('AZURE_STORAGE_ACCOUNT')}.blob.core.windows.net",
+ 
+            credential=credential
+ 
+        )
+ 
+        container_client = blob_service_client.get_container_client(container_name)
+ 
+        # Check if the container exists
+ 
+        if not container_client.exists():
+ 
+            raise Exception(f"Container '{container_name}' does not exist.")
+ 
+        blobs_list = container_client.list_blobs()
+ 
+        for blob in blobs_list:
+ 
+            blob_client = container_client.get_blob_client(blob)
+ 
+            download_file_path = os.path.join(local_path, blob.name)
+ 
+            os.makedirs(os.path.dirname(download_file_path), exist_ok=True)
+ 
+            with open(download_file_path, "wb") as download_file:
+ 
+                download_file.write(blob_client.download_blob().readall())
+ 
+            logging.info(f"Downloaded {blob.name} to {download_file_path}.")
+ 
+    except Exception as e:
+ 
+        logging.error(f"Failed to download blob files: {str(e)}")
+ 
+        raise
+ 
+def run_terraform_commands(local_path, terraform_path):
+ 
+    """Run Terraform init, validate, plan, and apply."""
+ 
+    try:
+ 
+        # Add Terraform to PATH
+ 
+        os.environ["PATH"] += os.pathsep + os.path.dirname(terraform_path)
+ 
+        # Change to the Azure_Function directory
+ 
+        azure_function_path = os.path.join(local_path, "Azure_Function/Azure_Function")
+ 
+        if not os.path.isdir(azure_function_path):
+ 
+            raise Exception(f"Directory '{azure_function_path}' does not exist.")
+ 
+        # Set environment variables for Terraform Azure authentication
+ 
+        os.environ["ARM_CLIENT_ID"] = os.getenv("AZURE_CLIENT_ID")
+ 
+        os.environ["ARM_CLIENT_SECRET"] = os.getenv("AZURE_CLIENT_SECRET")
+ 
+        os.environ["ARM_TENANT_ID"] = os.getenv("AZURE_TENANT_ID")
+ 
+        os.environ["ARM_SUBSCRIPTION_ID"] = os.getenv("ARM_SUBSCRIPTION_ID")
+ 
+        # Run Terraform init
+ 
+        subprocess.run([terraform_path, "init"], cwd=azure_function_path, check=True)
+ 
+        logging.info("Terraform init completed successfully.")
+ 
+        # Run Terraform validate
+ 
+        subprocess.run([terraform_path, "validate"], cwd=azure_function_path, check=True)
+ 
+        logging.info("Terraform validate completed successfully.")
+ 
+        # Run Terraform plan with var-file
+ 
+        tfvars_path = os.path.join(azure_function_path, "value.tfvars")
+ 
+        if not os.path.isfile(tfvars_path):
+ 
+            raise Exception(f"Terraform vars file '{tfvars_path}' does not exist.")
+ 
+        plan_process = subprocess.run(
+ 
+            [terraform_path, "plan", "-var-file=value.tfvars"],
+ 
+            cwd=azure_function_path,
+ 
+            capture_output=True,
+ 
+            text=True
+ 
+        )
+ 
+        if plan_process.returncode != 0:
+ 
+            raise Exception(f"Terraform plan failed: {plan_process.stderr}")
+ 
+        # Log the Terraform plan output
+ 
+        logging.info("Terraform plan output:\n" + plan_process.stdout)
+ 
+       # Run Terraform apply
+        apply_process = subprocess.run(
+            [terraform_path, "apply", f"-var-file={tfvars_path}", "-auto-approve"],
+            cwd=azure_function_path,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        logging.info("Terraform apply completed successfully.")
+        logging.info(f"Terraform apply output:\n{apply_process.stdout}")
+        logging.info(f"Terraform apply output code:\n{apply_process.returncode}")
+ 
+  
+ 
+        #if apply_process.returncode != 0:
+ 
+        #    raise Exception(f"Terraform apply failed: {apply_process.stderr}")
+         
+
+       # Get VM IP from Terraform output
+        output_process = subprocess.run(
+            [terraform_path, "output", "-json", "public_ip_address"],
+            cwd=azure_function_path,
+            capture_output=True,
+            text=True
+        )
+        if output_process.returncode != 0:
+            raise Exception(f"Failed to retrieve Terraform output: {output_process.stderr}")
+        # Parse the JSON output to extract the IP address
+           
+        output_json = json.loads(output_process.stdout)
+        if isinstance(output_json, dict) and "vm2" in output_json:
+          vm_ip = output_json["vm2"]  # Extract the IP address for "vm2"
+          logging.info(f"VM IP in output: {vm_ip}")
+        else:
+            raise Exception("Unexpected Terraform output format. Expected a dictionary with 'vm2' key.")
+    except json.JSONDecodeError as e:
+            raise Exception(f"Failed to parse Terraform output as JSON: {e}")
+    return vm_ip
+ 
+ 
+ 
+# Function to execute the PowerShell script remotely via WinRM
+def execute_ps_script(vm_ip, username, password, script):
+    try:
+        # Create a WinRM session
+        session = winrm.Session(f'http://{vm_ip}:5985/wsman', auth=(username, password), transport='ntlm')
+        # Prepare the PowerShell command to download scripts from Azure Blob and execute
+        ps_download_command = f"""
+        Invoke-WebRequest -Uri "https://eaifdevopspython.blob.core.windows.net/eaifdevopsterraformblob/Azure_Function/{script}?sv=2022-11-02&ss=bfqt&srt=sco&sp=rwdlacupiytfx&se=2025-12-12T22:42:16Z&st=2025-02-12T14:42:16Z&spr=https,http&sig=vLP%2BV9Y7vCsamI5EGWg03ZKsjxp0eqSNOBqesuVIXjQ%3D" -OutFile "C:\\{script}";
+        PowerShell.exe -ExecutionPolicy Bypass -File "C:\\{script}"
+        """
+        # Run the command remotely
+        result = session.run_ps(ps_download_command)
+        # Capture the output and errors
+        if result.status_code == 0:
+            logging.info(f"PowerShell script executed successfully: {result.std_out.decode()}")
+            return result.std_out.decode()
+        else:
+            logging.error(f"PowerShell script failed: {result.std_err.decode()}")
+            return None
+ 
+    except Exception as e:
+        logging.error(f"Error executing PowerShell script: {str(e)}")
+        return None
+ 
+ 
+@app.route(route="eaifpythonfunc", methods=["GET", "POST"])
+ 
+def eaifpythonfunc(req: func.HttpRequest) -> func.HttpResponse:
+ 
+    logging.info('Python HTTP trigger function processed a request.')
+ 
+    # Configuration
+ 
+    container_name = "eaifdevopsterraformblob"
+ 
+    local_path = "/tmp/terraform"
+ 
+    try:
+ 
+        # Install required tools (wget and unzip)
+ 
+        install_tools()
+ 
+        # Install Terraform
+ 
+        terraform_path = install_terraform(local_path)
+ 
+        # Download Terraform files from Azure Blob Container using Service Principal
+ 
+        download_blob_files(container_name, os.path.join(local_path, "Azure_Function"))
+ 
+        # Run Terraform commands
+ 
+        vm_ip = run_terraform_commands(local_path, terraform_path)
+ 
+        username = 'chozhan1'
+        password = 'Test1234'
+ 
+        # Script names to copy and execute (update with your actual script names)
+        ps_script_name = 'Git_py_vs.ps1'
+        #python_script_name = 'test.py'
+ 
+        # Execute PowerShell script remotely (it will download the script from Blob and execute)
+        ps_result = execute_ps_script(vm_ip, username, password, ps_script_name)
+ 
+        # Combine both results and return success response
+        if ps_result:
+            return func.HttpResponse(
+                f"Successfully executed PowerShell script.\nPowerShell result on VM IP: {vm_ip}: {ps_result}",
+                status_code=200
+            )
+        else:
+            return func.HttpResponse("Failed to execute the PowerShell script on the remote VM.  VM IP: {vm_ip}", status_code=500)
+ 
+ 
+        # Return VM IP in the response
+ 
+        #return func.HttpResponse(f"Terraform apply executed successfully. VM IP: {vm_ip}")
+ 
+ 
+    except Exception as e:
+ 
+        logging.error(f"An error occurred: {str(e)}")
+ 
+        return func.HttpResponse(f"An error occurred: {str(e)}", status_code=500)
+ 
+ 

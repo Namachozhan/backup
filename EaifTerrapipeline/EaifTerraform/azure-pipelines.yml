@@ -1,0 +1,353 @@
+trigger: none
+#- main  # Triggered manually or via external request (Postman) 
+variables:
+  terraformVersion: '1.10.5'  # Adjust to your Terraform version
+  azureSubscription: 'EaifdevopsMISC'
+  terraformWorkingDirectory: 'terraform'
+  inputJsonFilePath: 'input.json'  # Update with actual path to input.json file
+  tfvarsFile: 'value.tfvars'
+  scriptLocation: 'scripts'  # Path to your PowerShell script in Azure Repos
+  blobUrl: 'https://eaifdevopspython.blob.core.windows.net/winrmtest/value.tfvars'  # Replace with your blob URL
+  sasToken: '?sv=2022-11-02&ss=bfqt&srt=sco&sp=rwdlacupiytfx&se=2025-12-20T16:19:13Z&st=2025-02-20T08:19:13Z&spr=https,http&sig=bblOW1YzUdxMfxnd1fFdCasyUeus4GFPzNsLNi%2Bz8iE%3D'  # Replace with your SAS Token 
+jobs:
+- job: ProcessInputsAndTerraform
+  pool:
+    name: Eaifdevopsagentpool  # Replace with your agent pool name 
+  steps: 
+    # Step 1: Process JSON Inputs from API (via Postman)
+    - powershell: |
+        Write-Host "Starting script to process JSON variables." 
+        # Read environment variables (Pipeline Variables)
+        $vm = [System.Environment]::GetEnvironmentVariable("vm", "Process")
+        $repo = [System.Environment]::GetEnvironmentVariable("repo", "Process")
+        $config = [System.Environment]::GetEnvironmentVariable("config", "Process")  
+        # Debugging: Print Raw Values
+        Write-Host "Raw vm variable: '$vm'"
+        Write-Host "Raw config variable: '$config'" 
+        # Validate input presence
+        if ([string]::IsNullOrEmpty($vm)) {
+            Write-Host "ERROR: 'vm' variable is missing or empty."
+            exit 1
+        }
+        if ([string]::IsNullOrEmpty($config)) {
+            Write-Host "ERROR: 'config' variable is missing or empty."
+            exit 1
+        } 
+        if ([string]::IsNullOrEmpty($repo)) {
+            Write-Host "ERROR: 'repo' variable is missing or empty."
+            exit 1
+        }        
+        # Convert JSON strings to objects
+        try {
+            $vm_json = $vm | ConvertFrom-Json
+            $config_json = $config | ConvertFrom-Json
+
+        } catch {
+            Write-Host "ERROR: Failed to parse JSON input."
+            exit 1
+        } 
+        # Extract values
+        $vm_name = $vm_json.name
+        $vm_size = $vm_json.size
+        #vm name validation
+        if ($vm_name.Length -gt 12) {
+            Write-Host "ERROR: 'vm' variable exceeds 12 characters."
+        exit 1
+        }
+
+        # Validate allowed characters for 'vm' (only alphanumeric characters)
+        if ($vm_name -match '[^a-zA-Z0-9-]') {
+            Write-Host "ERROR: 'vm' variable contains invalid characters. Only alphanumeric characters and dashes (-) are allowed."
+            exit 1
+        }
+
+        # Print values
+        Write-Host "✅ VM Name: $vm_name"
+        Write-Host "✅ VM Size: $vm_size"
+        Write-Host "✅ Script executed successfully"
+        # Set the $vm variable as a pipeline variable for reuse in subsequent tasks
+        Write-Host "##vso[task.setvariable variable=vmJson]$vm"
+      displayName: 'Process and Print JSON Inputs using PowerShell'
+      env:
+        vm: $(vm)  # Pass the 'vm' JSON input from pipeline variables
+        config: $(config)  # Pass the 'config' JSON input from pipeline variables 
+
+    # Step 2: Update input.json with values from API input
+    - task: PowerShell@2
+      name: UpdateInputJson
+      inputs:
+        targetType: 'inline'
+        workingDirectory: $(Build.SourcesDirectory)/$(terraformWorkingDirectory)
+        script: |
+          Write-Host "Updating input.json with vm values." 
+          # Read the 'vm' JSON input passed as pipeline variable
+          $vm = '$(vm)' 
+          # Convert JSON input string to PowerShell object
+          $vmJson = $vm | ConvertFrom-Json 
+          # Path to input.json file that needs to be updated
+          $inputJsonPath = "$(inputJsonFilePath)" 
+          # Read existing content of input.json
+          $inputJsonContent = Get-Content -Path $inputJsonPath -Raw | ConvertFrom-Json 
+          # Update the 'vm' section in input.json with the new values
+          $inputJsonContent.vm.name = $vmJson.name
+          $inputJsonContent.vm.size = $vmJson.size
+          $inputJsonContent.vm.location = $vmJson.location 
+          # Convert updated object back to JSON and overwrite the file
+          $updatedJson = $inputJsonContent | ConvertTo-Json -Depth 3
+          $updatedJson | Set-Content -Path $inputJsonPath -Force 
+          Write-Host "input.json updated successfully."
+      displayName: 'Update input.json with vm input values'
+
+    # Step 3: Download value.tfvars from Azure Blob Storage
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        azureSubscription: $(azureSubscription)
+        script: |
+          Write-Host "Downloading value.tfvars from Azure Blob Storage..."
+          $blobUrlWithSas = "$(blobUrl)$(sasToken)"
+          $outputPath = "$(Build.SourcesDirectory)/$(terraformWorkingDirectory)/value.tfvars"
+          Invoke-WebRequest -Uri $blobUrlWithSas -OutFile $outputPath -UseBasicParsing
+          Write-Host "Downloaded value.tfvars to $outputPath"
+      displayName: 'Download value.tfvars from Blob Storage'
+
+    # Step 4: Run tfvarcreate.py to update value.tfvars and capture output
+    - task: PowerShell@2
+      name: CaptureVMMap
+      inputs:
+        targetType: 'inline'
+        workingDirectory: $(Build.SourcesDirectory)/$(terraformWorkingDirectory)
+        script: |
+          Write-Host "Running tfvarcreate.py to update value.tfvars..."
+          $pythonScript = "$(Build.SourcesDirectory)/$(terraformWorkingDirectory)/tfvarcreate.py"
+          # Run Python script and capture output
+          $vmmap = python $pythonScript
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "❌ ERROR: Python script failed."
+            Write-Host "$vmmap"
+            exit 1
+          }
+          Write-Host "✅ Python script executed successfully."
+          Write-Host "Output: $vmmap"
+          Write-Host "##vso[task.setvariable variable=vmmapnew]$vmmap"
+      displayName: 'Run tfvarcreate.py & Capture Output'
+
+    # Step 9: Upload updated tfVMDetailsOut.tfvars to Azure Blob Storage
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+          Copy-Item -Path "$(Build.SourcesDirectory)/$(terraformWorkingDirectory)/tfVMDetailsOut.tfvars" -Destination "$(Build.SourcesDirectory)/$(terraformWorkingDirectory)/value.tfvars" -Force
+          Write-Host "Uploading updated tfVMDetailsOut.tfvars to Azure Blob Storage..."
+          $blobUrlWithSas = "$(blobUrl)$(sasToken)"
+          $filePath = "$(Build.SourcesDirectory)/$(terraformWorkingDirectory)/tfVMDetailsOut.tfvars"
+          az storage blob upload --file `"$filePath`" --account-name eaifdevopspython --container-name winrmtest --name value.tfvars --sas-token `"$sasToken`" --overwrite
+          Write-Host "Uploaded updated value.tfvars to Azure Blob Storage"
+      displayName: 'Upload updated tfVMDetailsOut.tfvars to Blob Storage'
+
+    # Step 5: Terraform Init (Optional, if you want to apply changes immediately)
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)        
+        scriptType: powershell  # Using PowerShell for Windows
+        scriptLocation: inlineScript
+        workingDirectory: $(Build.SourcesDirectory)/$(terraformWorkingDirectory)  # Specify the correct working directory
+        inlineScript: |
+          Write-Host "Initializing Terraform..."
+          terraform init
+      displayName: 'Terraform init'
+
+    # Step 6: Terraform Validate (Optional, if you want to apply changes immediately)
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)        
+        scriptType: powershell  # Using PowerShell for Windows
+        scriptLocation: inlineScript
+        workingDirectory: $(Build.SourcesDirectory)/$(terraformWorkingDirectory)  # Specify the correct working directory
+        inlineScript: |
+          Write-Host "Validating Terraform configuration..."
+          terraform validate
+      displayName: 'Terraform validate'
+
+    #Step 7: Terraform plan (Optional, if you want to apply changes immediately)
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)        
+        scriptType: powershell  # Using PowerShell for Windows
+        scriptLocation: inlineScript
+        workingDirectory: $(Build.SourcesDirectory)/$(terraformWorkingDirectory)  # Specify the correct working directory
+        inlineScript: |
+          Write-Host "Running Terraform plan..."
+          terraform plan -var-file=$(tfvarsFile)
+      displayName: 'Terraform plan'
+
+    # Step 8: Terraform apply
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: powershell  # Using PowerShell for Windows
+        scriptLocation: inlineScript
+        workingDirectory: $(Build.SourcesDirectory)/$(terraformWorkingDirectory)  # Specify the correct working directory
+        inlineScript: |
+          Write-Host "Applying Terraform changes..."
+          terraform apply -auto-approve -var-file=$(tfvarsFile)
+      displayName: 'Terraform apply'
+
+    # Step 10: Retrieving Terraform output
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Retrieving Terraform output..."
+          $output = terraform output -json
+          $outputJson = $output | ConvertFrom-Json
+          # Access the public_ip_address map and retrieve the IP for vm2
+          $publicIpMap = $outputJson.public_ip_address.value
+          $vmmap1 = $env:vmmapnew
+          Write-Host "VM Map new variable: $vmmap1"
+          $vmIp = $publicIpMap.$vmmap1
+          Write-Host "Public IP Address for $vmmap1 $vmIp"
+          # Optionally, you can set the public IP as a pipeline variable
+          Write-Host "##vso[task.setvariable variable=vm2PublicIp]$vmIp"
+        workingDirectory: $(Build.SourcesDirectory)/$(terraformWorkingDirectory)  # Specify the correct working directory
+      displayName: 'Retrive Terraform output'
+
+    # Step11: Add the target VM's IP address to TrustedHosts
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Add the target VM's IP address to TrustedHosts
+          $trustedHosts = (Get-Item WSMan:\localhost\Client\TrustedHosts).Value
+          if ($trustedHosts -notcontains "$(vm2PublicIp)") {
+              Set-Item WSMan:\localhost\Client\TrustedHosts -Value "$(vm2PublicIp)" -Force
+              Write-Host "Added $(vm2PublicIp) to TrustedHosts."
+          } else {
+              Write-Host "$(vm2PublicIp) is already in TrustedHosts."
+          }
+          # Verify the TrustedHosts configuration
+          Write-Host "Current TrustedHosts: $(Get-Item WSMan:\localhost\Client\TrustedHosts).Value"
+        workingDirectory: $(Build.SourcesDirectory)/$(terraformWorkingDirectory)
+      displayName: 'Add the target VMs IP address to TrustedHosts'
+
+    # Step 12: Install Git, Python and Vscode
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          $publicIP = "$(vm2PublicIp)"  # Retrieve the IP address from the pipeline variable
+          $username = "chozhan1"  # Replace with your VM's username
+          $password = ConvertTo-SecureString "Test1234" -AsPlainText -Force  # Replace with your VM's password or use an encrypted value
+          $cred = New-Object System.Management.Automation.PSCredential ($username, $password)
+          Write-Host "Copying PowerShell script to remote VM at IP: $publicIP"
+          # Define the script path on the client machine
+          $localScriptPath = "$(Build.SourcesDirectory)/$(scriptLocation)/py_git_vscode.ps1"
+          # Define the remote script path on the target VM
+          $remoteScriptPath = "C:\py_git_vscode.ps1"
+          # Copy the script to the remote VM
+          Copy-Item -Path $localScriptPath -Destination $remoteScriptPath -ToSession (New-PSSession -ComputerName $publicIP -Credential $cred -Port 5985 -Authentication Basic)
+          Write-Host "Running remote PowerShell script on VM at IP: $publicIP"
+          # Execute the script on the remote VM
+          Invoke-Command -ComputerName $publicIP -Credential $cred -Port 5985 -Authentication Basic -ScriptBlock {
+              param($remoteScriptPath)
+              Write-Host "Executing remote script: $remoteScriptPath"
+              & $remoteScriptPath
+          } -ArgumentList $remoteScriptPath
+        workingDirectory: $(Build.SourcesDirectory)/$(scriptLocation)
+      displayName: 'Install Git, Python and Vscode'
+
+    # Step 13:  Creating Python venv
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          $publicIP = "$(vm2PublicIp)"  # Retrieve the IP address from the pipeline variable
+          $username = "chozhan1"  # Replace with your VM's username
+          $password = ConvertTo-SecureString "Test1234" -AsPlainText -Force  # Replace with your VM's password or use an encrypted value
+          $cred = New-Object System.Management.Automation.PSCredential ($username, $password)  
+          Write-Host "Copying PowerShell script to remote VM at IP: $publicIP"  
+          # Define the script path on the client machine
+          $localScriptPath = "$(Build.SourcesDirectory)/$(scriptLocation)/venv.py"  
+          # Define the remote script path on the target VM
+          $remoteScriptPath = "C:\venv.py"  
+          # Copy the script to the remote VM
+          Copy-Item -Path $localScriptPath -Destination $remoteScriptPath -ToSession (New-PSSession -ComputerName $publicIP -Credential $cred -Port 5985 -Authentication Basic)  
+          Write-Host "Running remote PowerShell script on VM at IP: $publicIP"  
+          # Execute the script on the remote VM
+          Invoke-Command -ComputerName $publicIP -Credential $cred -Port 5985 -Authentication Basic -ScriptBlock {
+              param($remoteScriptPath)
+              Write-Host "Executing remote script: $remoteScriptPath"
+              python $remoteScriptPath
+          } -ArgumentList $remoteScriptPath
+        workingDirectory: $(Build.SourcesDirectory)/$(scriptLocation)
+      displayName: 'Creating Python venv'
+
+    # Step 14: Repo cloning and utility install
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          $publicIP = "$(vm2PublicIp)"  # Retrieve the IP address from the pipeline variable
+          $username = "chozhan1"  # Replace with your VM's username
+          $password = ConvertTo-SecureString "Test1234" -AsPlainText -Force  # Replace with your VM's password or use an encrypted value
+          $cred = New-Object System.Management.Automation.PSCredential ($username, $password) 
+          Write-Host "Copying Python script to remote VM at IP: $publicIP" 
+          # Define the script path on the client machine
+          $localScriptPath = "$(Build.SourcesDirectory)/$(scriptLocation)/repo_clone.py" 
+          # Define the remote script path on the target VM
+          $remoteScriptPath = "C:\repo_clone.py" 
+          # Copy the script to the remote VM
+          Copy-Item -Path $localScriptPath -Destination $remoteScriptPath -ToSession (New-PSSession -ComputerName $publicIP -Credential $cred -Port 5985 -Authentication Basic) 
+          # Retrieve the $vm JSON input from the pipeline variable
+          $jsonInput = '$(repo)' 
+          $jsonInput = $jsonInput -replace '"', '\"' 
+          Write-Host "Running Python script with JSON input on VM at IP: $publicIP"
+          Write-Host "JSON input: $jsonInput" 
+          # Execute the script on the remote VM with JSON input
+          Invoke-Command -ComputerName $publicIP -Credential $cred -Port 5985 -Authentication Basic -ScriptBlock {
+              param($remoteScriptPath, $jsonInput)
+              Write-Host "Executing Python script: $remoteScriptPath"
+              Write-Host "JSON input: $jsonInput"
+              # Suppress stderr output
+              $ErrorActionPreference = "SilentlyContinue"
+              python $remoteScriptPath $jsonInput 2>&1 | Write-Host
+              $ErrorActionPreference = "Continue"  # Reset error handling
+          } -ArgumentList $remoteScriptPath, $jsonInput
+        workingDirectory: $(Build.SourcesDirectory)/$(scriptLocation)
+      displayName: 'Repo cloning and utility install'
+
+    #Step 15: Upadting config file
+    - task: PowerShell@2
+      inputs:
+        targetType: 'inline'
+        script: |
+          $publicIP = "$(vm2PublicIp)"  # Retrieve the IP address from the pipeline variable
+          $username = "chozhan1"  # Replace with your VM's username
+          $password = ConvertTo-SecureString "Test1234" -AsPlainText -Force  # Replace with your VM's password or use an encrypted value
+          $cred = New-Object System.Management.Automation.PSCredential ($username, $password) 
+          Write-Host "Copying Python script to remote VM at IP: $publicIP" 
+          # Define the script path on the client machine
+          $localScriptPath = "$(Build.SourcesDirectory)/$(scriptLocation)/update_config.py" 
+          # Define the remote script path on the target VM
+          $remoteScriptPath = "C:\update_config.py" 
+          # Copy the script to the remote VM
+          Copy-Item -Path $localScriptPath -Destination $remoteScriptPath -ToSession (New-PSSession -ComputerName $publicIP -Credential $cred -Port 5985 -Authentication Basic)
+          # Retrieve the $vm JSON input from the pipeline variable
+          $jsonInput = '$(config)' 
+          $jsonInput = $jsonInput -replace '"', '\"' 
+          Write-Host "Running Python script with JSON input on VM at IP: $publicIP"
+          Write-Host "JSON input: $jsonInput" 
+          # Execute the script on the remote VM with JSON input
+          Invoke-Command -ComputerName $publicIP -Credential $cred -Port 5985 -Authentication Basic -ScriptBlock {
+              param($remoteScriptPath, $jsonInput)
+              Write-Host "Executing Python script: $remoteScriptPath"
+              Write-Host "JSON input: $jsonInput"
+              # Suppress stderr output
+              $ErrorActionPreference = "SilentlyContinue"
+              python $remoteScriptPath --json $jsonInput 2>&1 | Write-Host
+              $ErrorActionPreference = "Continue"  # Reset error handling
+          } -ArgumentList $remoteScriptPath, $jsonInput
+        workingDirectory: $(Build.SourcesDirectory)/$(scriptLocation)
+      displayName: 'Upadting config file'
